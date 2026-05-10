@@ -1,0 +1,1102 @@
+"""
+HIFN-Mamba: Hybrid Information Flow Networks + Selective State Space (Mamba/S6)
+on CICIDS-2017 (Friday DDoS, binary).
+
+Author: Mohammed Tawfik  (kmkhol01@gmail.com, ORCID 0000-0002-1227-387X)
+
+Designed to run on Google Colab (Pro+, A100). Pure-PyTorch Mamba block — no
+mamba-ssm CUDA kernel required, so it runs on any GPU/CPU.
+
+USAGE (Colab):
+    Paste each `# %% --- ... ---` section into its own cell, or run end-to-end.
+"""
+
+# %% --- Cell 1: Install ---
+# !pip install -q kagglehub einops
+
+# %% --- Cell 2: Imports & config ---
+import os, time, math, warnings, json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix,
+                             classification_report, roc_auc_score, roc_curve)
+
+warnings.filterwarnings("ignore")
+sns.set_style("whitegrid")
+
+CFG = dict(
+    seed         = 42,
+    batch_size   = 512,
+    epochs       = 20,
+    lr           = 1e-3,
+    weight_decay = 1e-5,
+    # HIFN
+    d_hidden_1   = 256,
+    seq_len      = 16,         # how many tokens Mamba sees
+    d_model      = 64,         # token dim
+    # Mamba
+    d_state      = 16,
+    d_conv       = 4,
+    expand       = 2,
+    n_mamba      = 2,
+    # losses
+    lambda_kl    = 1e-4,
+    lambda_ent   = 1e-3,
+    lambda_gate  = 1e-4,       # L1 on gates (light, keeps sparsity story)
+)
+torch.manual_seed(CFG["seed"]); np.random.seed(CFG["seed"])
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {DEVICE}  |  torch {torch.__version__}")
+
+
+# %% --- Cell 3: Download CICIDS-2017 via kagglehub ---
+import kagglehub
+DATA_ROOT = kagglehub.dataset_download("chethuhn/network-intrusion-dataset")
+print("Dataset path:", DATA_ROOT)
+
+# Locate Friday DDoS file (matches your existing pipeline)
+file_path = ""
+for d, _, files in os.walk(DATA_ROOT):
+    for f in files:
+        if "Friday-WorkingHours-Afternoon-DDos" in f:
+            file_path = os.path.join(d, f)
+assert file_path, "Friday DDoS CSV not found"
+print("CSV:", file_path)
+
+
+# %% --- Cell 4: Load + preprocess (matches your existing pipeline) ---
+df = pd.read_csv(file_path)
+print(f"Loaded {len(df):,} packets, {df.shape[1]} cols")
+
+df.columns = df.columns.str.strip()
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+df.dropna(inplace=True)
+df["Label"] = df["Label"].apply(lambda x: 0 if x == "BENIGN" else 1)
+
+X = df.drop("Label", axis=1).values.astype(np.float32)
+y = df["Label"].values.astype(np.int64)
+FEATURE_NAMES = df.drop("Label", axis=1).columns.tolist()
+N_FEAT, N_CLS = X.shape[1], 2
+
+scaler = StandardScaler()
+X = scaler.fit_transform(X).astype(np.float32)
+
+X_tr, X_te, y_tr, y_te = train_test_split(
+    X, y, test_size=0.30, random_state=CFG["seed"], stratify=y
+)
+print(f"Train {X_tr.shape}  Test {X_te.shape}  features={N_FEAT}")
+print(f"Class balance — train: {np.bincount(y_tr)}  test: {np.bincount(y_te)}")
+
+train_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
+test_ds  = TensorDataset(torch.from_numpy(X_te), torch.from_numpy(y_te))
+train_ld = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True,  num_workers=2, pin_memory=True)
+test_ld  = DataLoader(test_ds,  batch_size=CFG["batch_size"], shuffle=False, num_workers=2, pin_memory=True)
+
+
+# %% --- Cell 5: Mamba (S6) block — pure PyTorch ---
+class MambaBlock(nn.Module):
+    """
+    Selective State Space (S6) block — Gu & Dao (2023), pure PyTorch.
+
+    Forward:
+        x: (B, L, d_model) -> (B, L, d_model)
+    Sequential scan in PyTorch is fine for small L (here L=16);
+    swap to mamba-ssm's selective_scan_fn if you want kernel speed on long seqs.
+    """
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv  = d_conv
+        self.d_inner = expand * d_model
+
+        self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
+        self.conv1d  = nn.Conv1d(self.d_inner, self.d_inner,
+                                 kernel_size=d_conv, groups=self.d_inner,
+                                 padding=d_conv - 1, bias=True)
+        # x -> (Δ, B_param, C_param)
+        self.x_proj  = nn.Linear(self.d_inner,
+                                 self.d_inner + 2 * d_state, bias=False)
+
+        # A parametrized as -exp(A_log) for stability (negative real eigenvalues)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D     = nn.Parameter(torch.ones(self.d_inner))   # skip
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def forward(self, x):
+        B, L, _ = x.shape
+        xz = self.in_proj(x)                                  # (B, L, 2*d_inner)
+        x_in, z = xz.chunk(2, dim=-1)                         # each (B, L, d_inner)
+
+        # 1D causal-ish conv along sequence
+        x_in = x_in.transpose(1, 2)
+        x_in = self.conv1d(x_in)[:, :, :L]
+        x_in = x_in.transpose(1, 2)
+        x_in = F.silu(x_in)
+
+        # selective parameters from input
+        proj = self.x_proj(x_in)
+        delta, B_par, C_par = torch.split(
+            proj, [self.d_inner, self.d_state, self.d_state], dim=-1
+        )
+        delta = F.softplus(delta)                             # (B, L, d_inner)
+
+        A = -torch.exp(self.A_log)                            # (d_inner, d_state)
+
+        # discretize
+        dA = torch.exp(delta.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))     # (B,L,di,ds)
+        dB = delta.unsqueeze(-1) * B_par.unsqueeze(-2)                        # (B,L,di,ds)
+        dBx = dB * x_in.unsqueeze(-1)                                         # (B,L,di,ds)
+
+        # sequential selective scan (L is small here)
+        h = torch.zeros(B, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(L):
+            h = dA[:, t] * h + dBx[:, t]
+            ys.append((h * C_par[:, t].unsqueeze(1)).sum(dim=-1))
+        y = torch.stack(ys, dim=1)                            # (B, L, d_inner)
+
+        y = y + self.D * x_in                                 # skip
+        y = y * F.silu(z)                                     # gate
+        return self.out_proj(y)
+
+
+# %% --- Cell 6: HIFN layer (4 learnable info-theoretic parameters) ---
+class HIFNLayer(nn.Module):
+    """
+    Hybrid Information Flow Network layer.
+
+    Four learnable parameters per layer:
+        β  (log_beta)         : information retention / KL weight
+        B  (log_entropy_budget): entropy capacity cap H(z) <= B
+        c  (logit_compression) : magnitude scaling in [0.3, 1.0]
+        g  (gates_logit)       : static, global per-feature gate (interpretable)
+    """
+    def __init__(self, d_in: int, d_out: int):
+        super().__init__()
+        self.d_in, self.d_out = d_in, d_out
+        self.encoder    = nn.Sequential(
+            nn.Linear(d_in, d_out * 2),
+            nn.LayerNorm(d_out * 2),
+            nn.GELU(),
+        )
+        self.to_mu      = nn.Linear(d_out * 2, d_out)
+        self.to_logvar  = nn.Linear(d_out * 2, d_out)
+
+        # learnable info-theoretic parameters
+        self.log_beta            = nn.Parameter(torch.tensor(-2.0))
+        self.log_entropy_budget  = nn.Parameter(torch.tensor(float(np.log(d_out))))
+        self.logit_compression   = nn.Parameter(torch.tensor(1.0))
+        self.gates_logit         = nn.Parameter(torch.zeros(d_in))
+
+    def forward(self, x, training: bool = True):
+        gates = torch.sigmoid(self.gates_logit)               # (d_in,)
+        x_g   = x * gates
+
+        h     = self.encoder(x_g)
+        mu    = self.to_mu(h)
+        logvar = self.to_logvar(h).clamp(-10.0, 10.0)
+
+        c     = 0.3 + 0.7 * torch.sigmoid(self.logit_compression)
+        mu    = mu * c
+
+        if training:
+            z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+        else:
+            z = mu
+
+        beta  = torch.exp(self.log_beta)
+        kl    = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(-1).mean()
+        kl    = beta * kl
+
+        H_z   = 0.5 * (1 + math.log(2 * math.pi) + logvar).sum(-1).mean()
+        B_tgt = torch.exp(self.log_entropy_budget)
+        ent_pen = F.relu(H_z - B_tgt)
+
+        return z, kl, ent_pen, gates
+
+
+# %% --- Cell 7: HIFN-Mamba model ---
+class HIFNMamba(nn.Module):
+    """
+    HIFN trunk -> tokenize to (seq_len, d_model) -> Mamba stack -> classifier.
+    Static input gates remain the interpretable handle (same as HIFN-T).
+    """
+    def __init__(self, n_features: int, n_classes: int, cfg=CFG):
+        super().__init__()
+        self.seq_len = cfg["seq_len"]
+        self.d_model = cfg["d_model"]
+
+        self.hifn1 = HIFNLayer(n_features, cfg["d_hidden_1"])
+        self.hifn2 = HIFNLayer(cfg["d_hidden_1"], cfg["seq_len"] * cfg["d_model"])
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, cfg["seq_len"], cfg["d_model"]))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        self.norms  = nn.ModuleList([nn.LayerNorm(cfg["d_model"]) for _ in range(cfg["n_mamba"])])
+        self.mambas = nn.ModuleList([
+            MambaBlock(cfg["d_model"], d_state=cfg["d_state"],
+                       d_conv=cfg["d_conv"], expand=cfg["expand"])
+            for _ in range(cfg["n_mamba"])
+        ])
+        self.head_norm   = nn.LayerNorm(cfg["d_model"])
+        self.classifier  = nn.Linear(cfg["d_model"], n_classes)
+
+    def forward(self, x, training: bool = True):
+        z1, kl1, ent1, g1 = self.hifn1(x,  training)
+        z2, kl2, ent2, _  = self.hifn2(z1, training)
+
+        tokens = z2.view(x.size(0), self.seq_len, self.d_model) + self.pos_embed
+        for norm, mamba in zip(self.norms, self.mambas):
+            tokens = tokens + mamba(norm(tokens))             # pre-norm residual
+        feat   = self.head_norm(tokens.mean(dim=1))
+        logits = self.classifier(feat)
+        return logits, kl1 + kl2, ent1 + ent2, g1             # g1 = input-feature gates
+
+
+# %% --- Cell 8: Train ---
+model = HIFNMamba(N_FEAT, N_CLS).to(DEVICE)
+n_params = sum(p.numel() for p in model.parameters())
+print(f"HIFN-Mamba: {n_params/1e6:.2f}M params")
+
+# class weights (CICIDS Friday is fairly balanced post-clean, but include for safety)
+counts = np.bincount(y_tr)
+cls_w  = torch.tensor(counts.sum() / (N_CLS * counts), dtype=torch.float32, device=DEVICE)
+
+opt   = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG["epochs"])
+ce    = nn.CrossEntropyLoss(weight=cls_w)
+
+hist = {k: [] for k in ["tr_loss", "tr_acc", "te_acc", "te_f1", "kl", "ent", "lr"]}
+
+for ep in range(1, CFG["epochs"] + 1):
+    model.train()
+    t0 = time.time()
+    n_seen = correct = 0; tot_loss = tot_kl = tot_ent = 0.0
+    for xb, yb in train_ld:
+        xb, yb = xb.to(DEVICE, non_blocking=True), yb.to(DEVICE, non_blocking=True)
+        opt.zero_grad()
+        logits, kl, ent, gates = model(xb, training=True)
+        loss = (ce(logits, yb)
+                + CFG["lambda_kl"]   * kl
+                + CFG["lambda_ent"]  * ent
+                + CFG["lambda_gate"] * gates.abs().sum())
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        n_seen  += yb.size(0)
+        correct += (logits.argmax(-1) == yb).sum().item()
+        tot_loss += loss.item() * yb.size(0)
+        tot_kl   += kl.item()   * yb.size(0)
+        tot_ent  += ent.item()  * yb.size(0)
+    sched.step()
+
+    # eval
+    model.eval()
+    yp_all, yt_all = [], []
+    with torch.no_grad():
+        for xb, yb in test_ld:
+            xb = xb.to(DEVICE, non_blocking=True)
+            logits, _, _, _ = model(xb, training=False)
+            yp_all.append(logits.argmax(-1).cpu().numpy())
+            yt_all.append(yb.numpy())
+    yp = np.concatenate(yp_all); yt = np.concatenate(yt_all)
+    te_acc = accuracy_score(yt, yp); te_f1 = f1_score(yt, yp, average="macro")
+
+    hist["tr_loss"].append(tot_loss / n_seen)
+    hist["tr_acc"] .append(correct / n_seen)
+    hist["te_acc"] .append(te_acc)
+    hist["te_f1"]  .append(te_f1)
+    hist["kl"]     .append(tot_kl / n_seen)
+    hist["ent"]    .append(tot_ent / n_seen)
+    hist["lr"]     .append(opt.param_groups[0]["lr"])
+
+    print(f"[{ep:02d}/{CFG['epochs']}]  loss {hist['tr_loss'][-1]:.4f}  "
+          f"tr_acc {hist['tr_acc'][-1]*100:.2f}%  "
+          f"te_acc {te_acc*100:.2f}%  te_f1 {te_f1:.4f}  "
+          f"kl {hist['kl'][-1]:.2f}  ent {hist['ent'][-1]:.2f}  "
+          f"({time.time()-t0:.1f}s)")
+
+
+# %% --- Cell 9: Final evaluation + inference latency ---
+model.eval()
+yp_all, yp_prob, yt_all = [], [], []
+t0 = time.time()
+with torch.no_grad():
+    for xb, yb in test_ld:
+        xb = xb.to(DEVICE, non_blocking=True)
+        logits, _, _, _ = model(xb, training=False)
+        prob = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
+        yp_all.append(logits.argmax(-1).cpu().numpy())
+        yp_prob.append(prob); yt_all.append(yb.numpy())
+infer_time = time.time() - t0
+
+yp = np.concatenate(yp_all); yt = np.concatenate(yt_all); pp = np.concatenate(yp_prob)
+acc  = accuracy_score(yt, yp)
+f1m  = f1_score(yt, yp, average="macro")
+f1w  = f1_score(yt, yp, average="weighted")
+auc  = roc_auc_score(yt, pp)
+
+print("="*60)
+print(f"HIFN-Mamba on CICIDS-2017 Friday DDoS (binary)")
+print(f"  Accuracy   : {acc*100:.4f}%")
+print(f"  Macro F1   : {f1m:.4f}")
+print(f"  Weighted F1: {f1w:.4f}")
+print(f"  ROC-AUC    : {auc:.4f}")
+print(f"  Inference  : {infer_time:.3f}s on {len(yt):,} samples "
+      f"({1000*infer_time/len(yt):.4f} ms/sample)")
+print("="*60)
+print(classification_report(yt, yp, target_names=["Benign", "DDoS"], digits=4))
+
+
+# %% --- Cell 10: Plots — training curves, gates, confusion, ROC ---
+os.makedirs("plots", exist_ok=True)
+ep_x = range(1, CFG["epochs"] + 1)
+
+fig, ax = plt.subplots(2, 2, figsize=(13, 8))
+ax[0,0].plot(ep_x, hist["tr_loss"], label="train loss"); ax[0,0].set_title("Loss"); ax[0,0].legend()
+ax[0,1].plot(ep_x, [a*100 for a in hist["tr_acc"]], label="train")
+ax[0,1].plot(ep_x, [a*100 for a in hist["te_acc"]], label="test")
+ax[0,1].set_ylabel("Acc (%)"); ax[0,1].set_title("Accuracy"); ax[0,1].legend()
+ax[1,0].plot(ep_x, hist["kl"],  label="KL");      ax[1,0].set_title("Information cost")
+ax[1,0].plot(ep_x, hist["ent"], label="Entropy penalty"); ax[1,0].legend()
+ax[1,1].plot(ep_x, hist["te_f1"]); ax[1,1].set_title("Test macro-F1")
+plt.tight_layout(); plt.savefig("plots/training_curves.png", dpi=150); plt.show()
+
+# Confusion matrix
+cm = confusion_matrix(yt, yp)
+plt.figure(figsize=(5,4))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=["Benign","DDoS"], yticklabels=["Benign","DDoS"])
+plt.xlabel("Predicted"); plt.ylabel("True"); plt.title("HIFN-Mamba Confusion Matrix")
+plt.tight_layout(); plt.savefig("plots/confusion.png", dpi=150); plt.show()
+
+# ROC curve
+fpr, tpr, _ = roc_curve(yt, pp)
+plt.figure(figsize=(5,4))
+plt.plot(fpr, tpr, label=f"AUC={auc:.4f}")
+plt.plot([0,1],[0,1], "k--", lw=0.8)
+plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title("ROC — HIFN-Mamba"); plt.legend()
+plt.tight_layout(); plt.savefig("plots/roc.png", dpi=150); plt.show()
+
+# HIFN gates (interpretability) — top 20 features
+gates = torch.sigmoid(model.hifn1.gates_logit).detach().cpu().numpy()
+order = np.argsort(gates)[::-1][:20]
+plt.figure(figsize=(9, 6))
+sns.barplot(x=gates[order], y=[FEATURE_NAMES[i] for i in order], palette="viridis")
+plt.title("Top-20 HIFN input gates (static, global feature importance)")
+plt.xlabel("Gate value σ(g)"); plt.tight_layout()
+plt.savefig("plots/gates_top20.png", dpi=150); plt.show()
+
+
+# %% --- Cell 11: Compare against your RandomForest baseline + summary ---
+from sklearn.ensemble import RandomForestClassifier
+rf = RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42, n_jobs=-1)
+rf.fit(X_tr, y_tr)
+t0 = time.time(); rf_p = rf.predict(X_te); rf_t = time.time() - t0
+rf_acc = accuracy_score(y_te, rf_p); rf_f1 = f1_score(y_te, rf_p, average="macro")
+
+summary = pd.DataFrame([
+    dict(model="RandomForest (your baseline)", acc=rf_acc, f1=rf_f1, infer_s=rf_t),
+    dict(model="HIFN-Mamba (ours)",            acc=acc,   f1=f1m, infer_s=infer_time),
+])
+print(summary.to_string(index=False))
+
+# learned info-theoretic parameters (the things that make HIFN, HIFN)
+print("\nLearned HIFN parameters:")
+for name, layer in [("hifn1", model.hifn1), ("hifn2", model.hifn2)]:
+    print(f"  {name}: β={torch.exp(layer.log_beta).item():.4f}  "
+          f"B={torch.exp(layer.log_entropy_budget).item():.2f}  "
+          f"c={(0.3 + 0.7*torch.sigmoid(layer.logit_compression)).item():.4f}  "
+          f"⟨g⟩={torch.sigmoid(layer.gates_logit).mean().item():.4f}")
+
+# save artifacts
+torch.save({"state_dict": model.state_dict(), "cfg": CFG,
+            "feature_names": FEATURE_NAMES, "history": hist},
+           "hifn_mamba_cicids.pt")
+with open("hifn_mamba_results.json", "w") as f:
+    json.dump({"acc": acc, "macro_f1": f1m, "weighted_f1": f1w,
+               "auc": auc, "infer_s": infer_time,
+               "rf_acc": rf_acc, "rf_f1": rf_f1, "rf_infer_s": rf_t,
+               "n_params_M": n_params / 1e6}, f, indent=2)
+print("\nSaved: hifn_mamba_cicids.pt, hifn_mamba_results.json, plots/*.png")
+
+"""
+HIFN-Mamba — Multi-class CICIDS-2017
+=====================================
+Hybrid Information Flow Networks + Selective State Space (Mamba/S6) on
+the full multi-class CICIDS-2017 benchmark (7 grouped attack classes).
+
+Author: Mohammed Tawfik  (kmkhol01@gmail.com, ORCID 0000-0002-1227-387X)
+
+PIPELINE (matches your reference notebook):
+  1. Download all CICIDS-2017 CSVs via kagglehub
+  2. Concat -> strip cols -> drop dupes -> drop identical cols
+  3. Replace inf, drop NaN, drop unique-value cols
+  4. Group attack labels into 7 classes (Normal, DoS, DDoS, PortScan, Brute Force, Bots, Web Attacks)
+  5. Drop highly-correlated + low-importance features (same lists you used)
+  6. Stratified subsample BENIGN to keep training tractable (otherwise BENIGN is 83%)
+  7. Standardize, stratified 70/30 split, class-weighted CE
+  8. Train HIFN-Mamba; produce 12 plots + saved artifacts
+
+PLOTS PRODUCED:
+  EDA (pre-train):
+    01_class_distribution.png
+    02_correlation_heatmap.png
+  Training:
+    03_training_curves.png      (loss / acc / F1 / KL / entropy / LR)
+    04_hifn_params_evolution.png (β, B, c per layer over epochs)
+    05_information_plane.png     (KL vs accuracy trajectory)
+  Evaluation:
+    06_confusion_raw.png
+    07_confusion_normalized.png
+    08_per_class_metrics.png     (precision / recall / F1 bars)
+    09_roc_ovr.png               (one-vs-rest ROC curves)
+    10_pr_ovr.png                (one-vs-rest PR curves)
+  HIFN interpretability:
+    11_gates_top20.png           (top-20 input feature gates)
+    12_tsne_embeddings.png       (t-SNE on HIFN-Mamba latent, color = class)
+"""
+
+# %% --- Cell 1: Install ---
+# !pip install -q kagglehub einops scikit-learn
+
+# %% --- Cell 2: Imports & config ---
+import os, time, math, warnings, json, gc
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.manifold import TSNE
+from sklearn.metrics import (accuracy_score, f1_score, precision_score, recall_score,
+                             confusion_matrix, classification_report,
+                             roc_auc_score, roc_curve, precision_recall_curve,
+                             average_precision_score)
+
+warnings.filterwarnings("ignore")
+sns.set_style("whitegrid")
+plt.rcParams.update({"figure.dpi": 110, "savefig.dpi": 150, "axes.titlesize": 12})
+
+CFG = dict(
+    seed         = 42,
+    # subsample (BENIGN is 83% of the data — undersample to keep train time reasonable)
+    benign_keep  = 300_000,        # set to None to keep all BENIGN samples
+    # split
+    test_size    = 0.30,
+    # training
+    batch_size   = 512,
+    epochs       = 20,
+    lr           = 1e-3,
+    weight_decay = 1e-5,
+    # HIFN
+    d_hidden_1   = 256,
+    seq_len      = 16,
+    d_model      = 64,
+    # Mamba
+    d_state      = 16,
+    d_conv       = 4,
+    expand       = 2,
+    n_mamba      = 2,
+    # losses
+    lambda_kl    = 1e-4,
+    lambda_ent   = 1e-3,
+    lambda_gate  = 1e-4,
+)
+torch.manual_seed(CFG["seed"]); np.random.seed(CFG["seed"])
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {DEVICE}  |  torch {torch.__version__}")
+
+os.makedirs("plots", exist_ok=True)
+os.makedirs("artifacts", exist_ok=True)
+
+
+# %% --- Cell 3: Download ---
+import kagglehub
+DATA_ROOT = kagglehub.dataset_download("chethuhn/network-intrusion-dataset")
+print("Dataset root:", DATA_ROOT)
+
+csv_paths = []
+for d, _, files in os.walk(DATA_ROOT):
+    for f in files:
+        if f.lower().endswith(".csv"):
+            csv_paths.append(os.path.join(d, f))
+print(f"Found {len(csv_paths)} CSVs")
+for p in csv_paths: print("  ", os.path.basename(p))
+
+
+# %% --- Cell 4: Load & concat all CSVs ---
+dfs = [pd.read_csv(p) for p in csv_paths]
+data = pd.concat(dfs, axis=0, ignore_index=True)
+del dfs; gc.collect()
+print(f"Combined: {data.shape}")
+
+# strip whitespace from column names
+data.columns = data.columns.str.strip()
+
+
+# %% --- Cell 5: Clean ---
+# 5.1 deduplicate rows
+n0 = len(data)
+data = data.drop_duplicates(keep="first")
+print(f"Removed {n0 - len(data):,} duplicate rows -> {len(data):,}")
+
+# 5.2 deduplicate columns by name (some CICIDS dumps have duplicate names)
+data = data.loc[:, ~data.columns.duplicated()]
+
+# 5.3 drop identical-content columns (e.g. 'Fwd Header Length' == 'Fwd Header Length.1')
+columns = data.columns.tolist()
+identical = {}
+seen = set()
+for i, c1 in enumerate(columns):
+    if c1 in seen: continue
+    for c2 in columns[i+1:]:
+        if c2 in seen: continue
+        if data[c1].equals(data[c2]):
+            identical.setdefault(c1, []).append(c2); seen.add(c2)
+to_drop = [c for v in identical.values() for c in v]
+if to_drop:
+    print(f"Dropping {len(to_drop)} identical-content cols: {to_drop}")
+    data.drop(columns=to_drop, inplace=True)
+
+# 5.4 inf -> NaN -> drop
+num_cols = data.select_dtypes(include=np.number).columns
+inf_count = np.isinf(data[num_cols]).sum().sum()
+print(f"Inf values: {inf_count}")
+data.replace([np.inf, -np.inf], np.nan, inplace=True)
+n0 = len(data)
+data = data.dropna()
+print(f"Dropped {n0 - len(data):,} rows with NaN -> {len(data):,}")
+
+# 5.5 drop columns with single unique value (zero variance)
+unique_cols = [c for c in data.columns if data[c].nunique() == 1]
+if unique_cols:
+    print(f"Dropping {len(unique_cols)} zero-variance cols: {unique_cols}")
+    data.drop(columns=unique_cols, inplace=True)
+
+print(f"After cleaning: {data.shape}")
+
+
+# %% --- Cell 6: Group attack types into 7 classes ---
+group_mapping = {
+    "BENIGN":                    "Normal",
+    "DoS Hulk":                  "DoS",
+    "DoS GoldenEye":             "DoS",
+    "DoS slowloris":             "DoS",
+    "DoS Slowhttptest":          "DoS",
+    "DDoS":                      "DDoS",
+    "PortScan":                  "PortScan",
+    "FTP-Patator":               "BruteForce",
+    "SSH-Patator":               "BruteForce",
+    "Bot":                       "Bots",
+    "Web Attack \x96 Brute Force": "WebAttack",
+    "Web Attack \x96 XSS":         "WebAttack",
+    "Web Attack \x96 Sql Injection":"WebAttack",
+    "Web Attack ï¿½ Brute Force": "WebAttack",
+    "Web Attack ï¿½ XSS":         "WebAttack",
+    "Web Attack ï¿½ Sql Injection":"WebAttack",
+    "Heartbleed":                "Misc",
+    "Infiltration":              "Misc",
+}
+data["Attack Type"] = data["Label"].map(lambda x: group_mapping.get(x, x))
+data.drop(columns=["Label"], inplace=True)
+
+# drop the very-low-count classes (< 100 samples) — same call your notebook makes
+data = data[~data["Attack Type"].isin(["Misc"])]
+print("\nClass distribution after grouping:")
+print(data["Attack Type"].value_counts())
+
+
+# %% --- Cell 7: Drop highly-correlated + low-importance features ---
+# (same drop lists as your reference notebook)
+redundant = ["Total Backward Packets", "Total Length of Bwd Packets",
+             "Subflow Bwd Bytes", "Avg Fwd Segment Size", "Avg Bwd Segment Size"]
+low_imp   = ["ECE Flag Count", "RST Flag Count", "Fwd URG Flags", "Idle Std",
+             "Fwd PSH Flags", "Active Std", "Down/Up Ratio", "URG Flag Count"]
+drop_now  = [c for c in (redundant + low_imp) if c in data.columns]
+data.drop(columns=drop_now, inplace=True)
+print(f"Dropped {len(drop_now)} redundant/low-importance cols")
+print(f"Final shape: {data.shape}")
+
+
+# %% --- Cell 8: Subsample BENIGN, encode labels, scale ---
+if CFG["benign_keep"] is not None:
+    benign  = data[data["Attack Type"] == "Normal"]
+    attacks = data[data["Attack Type"] != "Normal"]
+    if len(benign) > CFG["benign_keep"]:
+        benign = benign.sample(n=CFG["benign_keep"], random_state=CFG["seed"])
+    data = pd.concat([benign, attacks], ignore_index=True)
+    del benign, attacks; gc.collect()
+
+print("Final class distribution:")
+print(data["Attack Type"].value_counts())
+
+# label encode
+le = LabelEncoder()
+y = le.fit_transform(data["Attack Type"].values).astype(np.int64)
+CLASS_NAMES = list(le.classes_)
+N_CLS = len(CLASS_NAMES)
+print(f"\n{N_CLS} classes: {CLASS_NAMES}")
+
+X = data.drop(columns=["Attack Type"]).values.astype(np.float32)
+FEATURE_NAMES = data.drop(columns=["Attack Type"]).columns.tolist()
+N_FEAT = X.shape[1]
+print(f"Feature matrix: {X.shape}")
+
+del data; gc.collect()
+
+scaler = StandardScaler()
+X = scaler.fit_transform(X).astype(np.float32)
+
+X_tr, X_te, y_tr, y_te = train_test_split(
+    X, y, test_size=CFG["test_size"], random_state=CFG["seed"], stratify=y
+)
+print(f"Train {X_tr.shape}  Test {X_te.shape}")
+
+train_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
+test_ds  = TensorDataset(torch.from_numpy(X_te), torch.from_numpy(y_te))
+train_ld = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True,
+                      num_workers=2, pin_memory=True)
+test_ld  = DataLoader(test_ds,  batch_size=CFG["batch_size"], shuffle=False,
+                      num_workers=2, pin_memory=True)
+
+
+# %% --- Cell 9: EDA plots (class distribution + correlation heatmap) ---
+# 01 — class distribution
+counts = pd.Series(y_tr).value_counts().sort_index()
+plt.figure(figsize=(10, 5))
+ax = sns.barplot(x=[CLASS_NAMES[i] for i in counts.index],
+                 y=counts.values, palette="viridis")
+for i, v in enumerate(counts.values):
+    ax.text(i, v, f"{v:,}", ha="center", va="bottom", fontsize=9)
+plt.yscale("log"); plt.ylabel("Train samples (log scale)")
+plt.title("CICIDS-2017 — Class Distribution (train split, after grouping & subsample)")
+plt.xticks(rotation=20)
+plt.tight_layout(); plt.savefig("plots/01_class_distribution.png"); plt.show()
+
+# 02 — correlation heatmap (sample to keep readable)
+sample_idx = np.random.choice(len(X_tr), size=min(20_000, len(X_tr)), replace=False)
+corr = pd.DataFrame(X_tr[sample_idx], columns=FEATURE_NAMES).corr()
+plt.figure(figsize=(16, 13))
+sns.heatmap(corr, cmap="coolwarm", center=0, square=True,
+            xticklabels=True, yticklabels=True, cbar_kws={"shrink": 0.7})
+plt.title(f"Feature Correlation Heatmap ({len(FEATURE_NAMES)} features)")
+plt.xticks(fontsize=7, rotation=90); plt.yticks(fontsize=7)
+plt.tight_layout(); plt.savefig("plots/02_correlation_heatmap.png"); plt.show()
+
+
+# %% --- Cell 10: Mamba (S6) block — pure PyTorch ---
+class MambaBlock(nn.Module):
+    """Selective State Space (S6) block — Gu & Dao 2023, pure-PyTorch sequential scan."""
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_inner = expand * d_model
+
+        self.in_proj  = nn.Linear(d_model, 2 * self.d_inner, bias=False)
+        self.conv1d   = nn.Conv1d(self.d_inner, self.d_inner,
+                                  kernel_size=d_conv, groups=self.d_inner,
+                                  padding=d_conv - 1, bias=True)
+        self.x_proj   = nn.Linear(self.d_inner, self.d_inner + 2 * d_state, bias=False)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log    = nn.Parameter(torch.log(A))
+        self.D        = nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def forward(self, x):
+        B, L, _ = x.shape
+        xz = self.in_proj(x); x_in, z = xz.chunk(2, dim=-1)
+        x_in = self.conv1d(x_in.transpose(1, 2))[:, :, :L].transpose(1, 2)
+        x_in = F.silu(x_in)
+        proj = self.x_proj(x_in)
+        delta, B_par, C_par = torch.split(
+            proj, [self.d_inner, self.d_state, self.d_state], dim=-1)
+        delta = F.softplus(delta)
+        A = -torch.exp(self.A_log)
+        dA  = torch.exp(delta.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
+        dBx = (delta.unsqueeze(-1) * B_par.unsqueeze(-2)) * x_in.unsqueeze(-1)
+        h = torch.zeros(B, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(L):
+            h = dA[:, t] * h + dBx[:, t]
+            ys.append((h * C_par[:, t].unsqueeze(1)).sum(-1))
+        y = torch.stack(ys, dim=1) + self.D * x_in
+        return self.out_proj(y * F.silu(z))
+
+
+# %% --- Cell 11: HIFN layer (β, B, c, gates) ---
+class HIFNLayer(nn.Module):
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(d_in, d_out * 2),
+            nn.LayerNorm(d_out * 2),
+            nn.GELU(),
+        )
+        self.to_mu     = nn.Linear(d_out * 2, d_out)
+        self.to_logvar = nn.Linear(d_out * 2, d_out)
+        self.log_beta            = nn.Parameter(torch.tensor(-2.0))
+        self.log_entropy_budget  = nn.Parameter(torch.tensor(float(np.log(d_out))))
+        self.logit_compression   = nn.Parameter(torch.tensor(1.0))
+        self.gates_logit         = nn.Parameter(torch.zeros(d_in))
+
+    def forward(self, x, training=True):
+        gates = torch.sigmoid(self.gates_logit)
+        h     = self.encoder(x * gates)
+        mu    = self.to_mu(h)
+        lv    = self.to_logvar(h).clamp(-10, 10)
+        c     = 0.3 + 0.7 * torch.sigmoid(self.logit_compression)
+        mu    = mu * c
+        z     = mu + torch.randn_like(mu) * torch.exp(0.5 * lv) if training else mu
+        kl    = torch.exp(self.log_beta) * (-0.5 * (1 + lv - mu.pow(2) - lv.exp()).sum(-1).mean())
+        H_z   = 0.5 * (1 + math.log(2 * math.pi) + lv).sum(-1).mean()
+        ent   = F.relu(H_z - torch.exp(self.log_entropy_budget))
+        return z, kl, ent, gates
+
+
+# %% --- Cell 12: HIFN-Mamba ---
+class HIFNMamba(nn.Module):
+    def __init__(self, n_features, n_classes, cfg=CFG):
+        super().__init__()
+        self.seq_len = cfg["seq_len"]; self.d_model = cfg["d_model"]
+        self.hifn1   = HIFNLayer(n_features, cfg["d_hidden_1"])
+        self.hifn2   = HIFNLayer(cfg["d_hidden_1"], cfg["seq_len"] * cfg["d_model"])
+        self.pos     = nn.Parameter(torch.zeros(1, cfg["seq_len"], cfg["d_model"]))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.norms   = nn.ModuleList([nn.LayerNorm(cfg["d_model"]) for _ in range(cfg["n_mamba"])])
+        self.mambas  = nn.ModuleList([
+            MambaBlock(cfg["d_model"], d_state=cfg["d_state"],
+                       d_conv=cfg["d_conv"], expand=cfg["expand"])
+            for _ in range(cfg["n_mamba"])])
+        self.head_norm  = nn.LayerNorm(cfg["d_model"])
+        self.classifier = nn.Linear(cfg["d_model"], n_classes)
+
+    def forward(self, x, training=True, return_embed=False):
+        z1, kl1, ent1, g1 = self.hifn1(x,  training)
+        z2, kl2, ent2, _  = self.hifn2(z1, training)
+        tokens = z2.view(x.size(0), self.seq_len, self.d_model) + self.pos
+        for norm, mb in zip(self.norms, self.mambas):
+            tokens = tokens + mb(norm(tokens))
+        feat   = self.head_norm(tokens.mean(dim=1))
+        logits = self.classifier(feat)
+        if return_embed:
+            return logits, kl1 + kl2, ent1 + ent2, g1, feat
+        return logits, kl1 + kl2, ent1 + ent2, g1
+
+
+# %% --- Cell 13: Train ---
+model = HIFNMamba(N_FEAT, N_CLS).to(DEVICE)
+n_params = sum(p.numel() for p in model.parameters())
+print(f"HIFN-Mamba: {n_params/1e6:.2f}M params  |  features={N_FEAT}  classes={N_CLS}")
+
+cls_counts = np.bincount(y_tr, minlength=N_CLS)
+cls_weights = torch.tensor(cls_counts.sum() / (N_CLS * cls_counts),
+                           dtype=torch.float32, device=DEVICE)
+print(f"Class weights: {dict(zip(CLASS_NAMES, [round(w,2) for w in cls_weights.tolist()]))}")
+
+opt   = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG["epochs"])
+ce    = nn.CrossEntropyLoss(weight=cls_weights)
+
+hist = {k: [] for k in ["tr_loss", "tr_acc", "te_acc", "te_f1", "kl", "ent", "lr",
+                        "beta1", "B1", "c1", "beta2", "B2", "c2"]}
+best_te_f1, best_state = -1.0, None
+
+for ep in range(1, CFG["epochs"] + 1):
+    model.train(); t0 = time.time()
+    n_seen = correct = 0; tot_loss = tot_kl = tot_ent = 0.0
+    for xb, yb in train_ld:
+        xb, yb = xb.to(DEVICE, non_blocking=True), yb.to(DEVICE, non_blocking=True)
+        opt.zero_grad()
+        logits, kl, ent, gates = model(xb, training=True)
+        loss = (ce(logits, yb)
+                + CFG["lambda_kl"]   * kl
+                + CFG["lambda_ent"]  * ent
+                + CFG["lambda_gate"] * gates.abs().sum())
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        n_seen   += yb.size(0)
+        correct  += (logits.argmax(-1) == yb).sum().item()
+        tot_loss += loss.item() * yb.size(0)
+        tot_kl   += kl.item()   * yb.size(0)
+        tot_ent  += ent.item()  * yb.size(0)
+    sched.step()
+
+    # eval
+    model.eval(); yp_all, yt_all = [], []
+    with torch.no_grad():
+        for xb, yb in test_ld:
+            xb = xb.to(DEVICE, non_blocking=True)
+            logits, _, _, _ = model(xb, training=False)
+            yp_all.append(logits.argmax(-1).cpu().numpy()); yt_all.append(yb.numpy())
+    yp = np.concatenate(yp_all); yt = np.concatenate(yt_all)
+    te_acc = accuracy_score(yt, yp); te_f1 = f1_score(yt, yp, average="macro")
+
+    # snapshot HIFN params
+    h1, h2 = model.hifn1, model.hifn2
+    hist["tr_loss"].append(tot_loss/n_seen); hist["tr_acc"].append(correct/n_seen)
+    hist["te_acc"].append(te_acc); hist["te_f1"].append(te_f1)
+    hist["kl"].append(tot_kl/n_seen); hist["ent"].append(tot_ent/n_seen)
+    hist["lr"].append(opt.param_groups[0]["lr"])
+    hist["beta1"].append(torch.exp(h1.log_beta).item())
+    hist["B1"   ].append(torch.exp(h1.log_entropy_budget).item())
+    hist["c1"   ].append((0.3 + 0.7*torch.sigmoid(h1.logit_compression)).item())
+    hist["beta2"].append(torch.exp(h2.log_beta).item())
+    hist["B2"   ].append(torch.exp(h2.log_entropy_budget).item())
+    hist["c2"   ].append((0.3 + 0.7*torch.sigmoid(h2.logit_compression)).item())
+
+    print(f"[{ep:02d}/{CFG['epochs']}]  loss {hist['tr_loss'][-1]:.4f}  "
+          f"tr_acc {hist['tr_acc'][-1]*100:.2f}%  "
+          f"te_acc {te_acc*100:.2f}%  te_f1 {te_f1:.4f}  "
+          f"kl {hist['kl'][-1]:.2f}  ent {hist['ent'][-1]:.2f}  "
+          f"({time.time()-t0:.1f}s)")
+
+    if te_f1 > best_te_f1:
+        best_te_f1 = te_f1
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+# restore best
+model.load_state_dict(best_state)
+torch.save({"state_dict": best_state, "cfg": CFG, "history": hist,
+            "feature_names": FEATURE_NAMES, "class_names": CLASS_NAMES},
+           "artifacts/hifn_mamba_cicids_multiclass.pt")
+
+
+# %% --- Cell 14: Final eval — accuracy / F1 / AUC + per-class report ---
+model.eval()
+yp_all, prob_all, yt_all, embed_all = [], [], [], []
+t0 = time.time()
+with torch.no_grad():
+    for xb, yb in test_ld:
+        xb = xb.to(DEVICE, non_blocking=True)
+        logits, _, _, _, feat = model(xb, training=False, return_embed=True)
+        prob = F.softmax(logits, dim=-1).cpu().numpy()
+        yp_all.append(logits.argmax(-1).cpu().numpy())
+        prob_all.append(prob); yt_all.append(yb.numpy())
+        embed_all.append(feat.cpu().numpy())
+infer_time = time.time() - t0
+
+yp   = np.concatenate(yp_all)
+prob = np.concatenate(prob_all, axis=0)
+yt   = np.concatenate(yt_all)
+EMB  = np.concatenate(embed_all, axis=0)
+
+acc  = accuracy_score(yt, yp)
+f1m  = f1_score(yt, yp, average="macro")
+f1w  = f1_score(yt, yp, average="weighted")
+prec_m = precision_score(yt, yp, average="macro", zero_division=0)
+rec_m  = recall_score(yt, yp, average="macro", zero_division=0)
+
+# multi-class one-vs-rest AUC (handle classes that may be missing in y_true rare)
+present = sorted(np.unique(yt))
+auc_macro = roc_auc_score(yt, prob[:, present], multi_class="ovr",
+                          average="macro", labels=present)
+
+print("=" * 70)
+print(f"HIFN-Mamba on CICIDS-2017 ({N_CLS} classes)")
+print(f"  Accuracy        : {acc*100:.4f}%")
+print(f"  Macro F1        : {f1m:.4f}")
+print(f"  Weighted F1     : {f1w:.4f}")
+print(f"  Macro Precision : {prec_m:.4f}")
+print(f"  Macro Recall    : {rec_m:.4f}")
+print(f"  Macro ROC-AUC   : {auc_macro:.4f}")
+print(f"  Inference       : {infer_time:.2f}s on {len(yt):,} samples "
+      f"({1000*infer_time/len(yt):.4f} ms/sample)")
+print("=" * 70)
+print(classification_report(yt, yp, target_names=CLASS_NAMES, digits=4))
+
+
+# %% --- Cell 15: Plot 03 — training curves ---
+ep_x = range(1, CFG["epochs"] + 1)
+fig, ax = plt.subplots(2, 3, figsize=(16, 8))
+ax[0,0].plot(ep_x, hist["tr_loss"], "C0", lw=2); ax[0,0].set_title("Train loss")
+ax[0,1].plot(ep_x, [a*100 for a in hist["tr_acc"]], label="train", lw=2)
+ax[0,1].plot(ep_x, [a*100 for a in hist["te_acc"]], label="test",  lw=2)
+ax[0,1].set_ylabel("Accuracy (%)"); ax[0,1].set_title("Accuracy"); ax[0,1].legend()
+ax[0,2].plot(ep_x, hist["te_f1"], "C2", lw=2); ax[0,2].set_title("Test macro-F1")
+ax[1,0].plot(ep_x, hist["kl"],  "C3", lw=2); ax[1,0].set_title("KL divergence (HIFN)")
+ax[1,1].plot(ep_x, hist["ent"], "C4", lw=2); ax[1,1].set_title("Entropy penalty (HIFN)")
+ax[1,2].plot(ep_x, hist["lr"],  "C5", lw=2); ax[1,2].set_title("Learning rate")
+for a in ax.flat: a.set_xlabel("Epoch"); a.grid(True, alpha=0.3)
+plt.suptitle(f"HIFN-Mamba training (best test macro-F1: {best_te_f1:.4f})", fontsize=13)
+plt.tight_layout(); plt.savefig("plots/03_training_curves.png"); plt.show()
+
+
+# %% --- Cell 16: Plot 04 — HIFN learned parameters evolution ---
+fig, ax = plt.subplots(1, 3, figsize=(16, 4.5))
+ax[0].plot(ep_x, hist["beta1"], "o-", label="HIFN-1", lw=2)
+ax[0].plot(ep_x, hist["beta2"], "s-", label="HIFN-2", lw=2)
+ax[0].set_yscale("log"); ax[0].set_title(r"Learned $\beta_\ell$ (log scale)")
+ax[0].set_xlabel("Epoch"); ax[0].legend()
+ax[1].plot(ep_x, hist["B1"], "o-", label="HIFN-1", lw=2)
+ax[1].plot(ep_x, hist["B2"], "s-", label="HIFN-2", lw=2)
+ax[1].set_title(r"Entropy budget $B_\ell$"); ax[1].set_xlabel("Epoch"); ax[1].legend()
+ax[2].plot(ep_x, hist["c1"], "o-", label="HIFN-1", lw=2)
+ax[2].plot(ep_x, hist["c2"], "s-", label="HIFN-2", lw=2)
+ax[2].set_title(r"Compression scaling $c_\ell$"); ax[2].set_xlabel("Epoch"); ax[2].legend()
+ax[2].set_ylim(0.25, 1.05)
+for a in ax: a.grid(True, alpha=0.3)
+plt.suptitle("HIFN learned info-theoretic parameters over training", fontsize=13)
+plt.tight_layout(); plt.savefig("plots/04_hifn_params_evolution.png"); plt.show()
+
+
+# %% --- Cell 17: Plot 05 — Information plane trajectory (KL vs accuracy) ---
+plt.figure(figsize=(7, 5.5))
+sc = plt.scatter(hist["kl"], [a*100 for a in hist["te_acc"]],
+                 c=list(ep_x), cmap="viridis", s=60, edgecolors="k", lw=0.5)
+plt.plot(hist["kl"], [a*100 for a in hist["te_acc"]], "k-", alpha=0.3, lw=1)
+plt.colorbar(sc, label="Epoch")
+plt.xlabel("Mean KL divergence (proxy for I(X;Z))")
+plt.ylabel("Test accuracy (%) (proxy for I(Z;Y))")
+plt.title("Information plane trajectory")
+plt.tight_layout(); plt.savefig("plots/05_information_plane.png"); plt.show()
+
+
+# %% --- Cell 18: Plot 06+07 — confusion matrices (raw + normalized) ---
+cm     = confusion_matrix(yt, yp, labels=range(N_CLS))
+cm_pct = cm / cm.sum(axis=1, keepdims=True) * 100
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, cbar=True)
+plt.xlabel("Predicted"); plt.ylabel("True"); plt.title("Confusion matrix — counts")
+plt.xticks(rotation=30, ha="right"); plt.yticks(rotation=0)
+plt.tight_layout(); plt.savefig("plots/06_confusion_raw.png"); plt.show()
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm_pct, annot=True, fmt=".1f", cmap="Greens",
+            xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, cbar=True,
+            vmin=0, vmax=100)
+plt.xlabel("Predicted"); plt.ylabel("True")
+plt.title("Confusion matrix — row-normalized (recall %)")
+plt.xticks(rotation=30, ha="right"); plt.yticks(rotation=0)
+plt.tight_layout(); plt.savefig("plots/07_confusion_normalized.png"); plt.show()
+
+
+# %% --- Cell 19: Plot 08 — per-class precision / recall / F1 ---
+prec_pc = precision_score(yt, yp, average=None, zero_division=0, labels=range(N_CLS))
+rec_pc  = recall_score   (yt, yp, average=None, zero_division=0, labels=range(N_CLS))
+f1_pc   = f1_score       (yt, yp, average=None, zero_division=0, labels=range(N_CLS))
+
+dfm = pd.DataFrame({"Class": CLASS_NAMES,
+                    "Precision": prec_pc, "Recall": rec_pc, "F1": f1_pc})
+dfm_long = dfm.melt(id_vars="Class", var_name="Metric", value_name="Score")
+
+plt.figure(figsize=(11, 5))
+ax = sns.barplot(data=dfm_long, x="Class", y="Score", hue="Metric",
+                 palette=["#4C72B0", "#55A868", "#C44E52"])
+for p in ax.patches:
+    h = p.get_height()
+    if h > 0:
+        ax.text(p.get_x() + p.get_width()/2, h + 0.005, f"{h:.2f}",
+                ha="center", va="bottom", fontsize=7)
+plt.ylim(0, 1.08); plt.ylabel("Score")
+plt.title("Per-class Precision / Recall / F1 — HIFN-Mamba")
+plt.xticks(rotation=20)
+plt.tight_layout(); plt.savefig("plots/08_per_class_metrics.png"); plt.show()
+
+
+# %% --- Cell 20: Plot 09 — one-vs-rest ROC curves ---
+plt.figure(figsize=(8, 7))
+y_onehot = np.eye(N_CLS)[yt]
+for i in range(N_CLS):
+    if y_onehot[:, i].sum() == 0: continue
+    fpr, tpr, _ = roc_curve(y_onehot[:, i], prob[:, i])
+    a = roc_auc_score(y_onehot[:, i], prob[:, i])
+    plt.plot(fpr, tpr, lw=2, label=f"{CLASS_NAMES[i]} (AUC={a:.4f})")
+plt.plot([0, 1], [0, 1], "k--", lw=0.8)
+plt.xlabel("FPR"); plt.ylabel("TPR")
+plt.title("ROC — one-vs-rest")
+plt.legend(loc="lower right", fontsize=9)
+plt.tight_layout(); plt.savefig("plots/09_roc_ovr.png"); plt.show()
+
+
+# %% --- Cell 21: Plot 10 — one-vs-rest PR curves ---
+plt.figure(figsize=(8, 7))
+for i in range(N_CLS):
+    if y_onehot[:, i].sum() == 0: continue
+    p, r, _ = precision_recall_curve(y_onehot[:, i], prob[:, i])
+    ap = average_precision_score(y_onehot[:, i], prob[:, i])
+    plt.plot(r, p, lw=2, label=f"{CLASS_NAMES[i]} (AP={ap:.4f})")
+plt.xlabel("Recall"); plt.ylabel("Precision")
+plt.title("Precision-Recall — one-vs-rest")
+plt.legend(loc="lower left", fontsize=9)
+plt.tight_layout(); plt.savefig("plots/10_pr_ovr.png"); plt.show()
+
+
+# %% --- Cell 22: Plot 11 — top-20 HIFN input gates ---
+gates = torch.sigmoid(model.hifn1.gates_logit).detach().cpu().numpy()
+order = np.argsort(gates)[::-1][:20]
+plt.figure(figsize=(10, 7))
+sns.barplot(x=gates[order], y=[FEATURE_NAMES[i] for i in order],
+            palette="viridis")
+for i, v in enumerate(gates[order]):
+    plt.text(v, i, f"  {v:.3f}", va="center", fontsize=8)
+plt.xlabel(r"Gate value $\sigma(g)$")
+plt.title("Top-20 HIFN input gates — static, global feature importance")
+plt.tight_layout(); plt.savefig("plots/11_gates_top20.png"); plt.show()
+
+
+# %% --- Cell 23: Plot 12 — t-SNE of HIFN-Mamba embeddings ---
+print("Running t-SNE on a 5,000-sample subset...")
+n_tsne = min(5000, len(EMB))
+idx_tsne = np.random.choice(len(EMB), size=n_tsne, replace=False)
+emb_2d = TSNE(n_components=2, perplexity=30, init="pca",
+              random_state=CFG["seed"], n_iter=1000).fit_transform(EMB[idx_tsne])
+
+plt.figure(figsize=(9, 7))
+palette = sns.color_palette("husl", N_CLS)
+for i, name in enumerate(CLASS_NAMES):
+    sel = yt[idx_tsne] == i
+    if sel.sum() == 0: continue
+    plt.scatter(emb_2d[sel, 0], emb_2d[sel, 1], s=10, alpha=0.7,
+                color=palette[i], label=f"{name} (n={sel.sum()})")
+plt.legend(markerscale=2, fontsize=9, loc="best")
+plt.title("t-SNE — HIFN-Mamba latent embeddings (test subset)")
+plt.xlabel("t-SNE 1"); plt.ylabel("t-SNE 2")
+plt.tight_layout(); plt.savefig("plots/12_tsne_embeddings.png"); plt.show()
+
+
+# %% --- Cell 24: Save final results JSON ---
+results = dict(
+    accuracy=float(acc), macro_f1=float(f1m), weighted_f1=float(f1w),
+    macro_precision=float(prec_m), macro_recall=float(rec_m),
+    macro_auc=float(auc_macro),
+    infer_seconds=float(infer_time), n_test=int(len(yt)),
+    n_params_M=float(n_params/1e6),
+    classes=CLASS_NAMES, n_features=int(N_FEAT),
+    per_class={CLASS_NAMES[i]: dict(precision=float(prec_pc[i]),
+                                    recall=float(rec_pc[i]),
+                                    f1=float(f1_pc[i]))
+               for i in range(N_CLS)},
+    final_hifn_params=dict(
+        hifn1=dict(beta=hist["beta1"][-1], B=hist["B1"][-1], c=hist["c1"][-1]),
+        hifn2=dict(beta=hist["beta2"][-1], B=hist["B2"][-1], c=hist["c2"][-1])),
+)
+with open("artifacts/hifn_mamba_results.json", "w") as f:
+    json.dump(results, f, indent=2)
+
+print("\nSaved:")
+print("  artifacts/hifn_mamba_cicids_multiclass.pt")
+print("  artifacts/hifn_mamba_results.json")
+print("  plots/01..12_*.png")
